@@ -510,6 +510,7 @@ cc_library(
     linkopts = ABSL_DEFAULT_LINKOPTS,
     deps = [
         ":have_sse",
+        ":have_neon",
         "//absl/base",
         "//absl/base:core_headers",
         "//absl/debugging:stacktrace",
@@ -528,6 +529,7 @@ cc_test(
     deps = [
         ":hashtablez_sampler",
         ":have_sse",
+        ":have_neon",
         "//absl/base:core_headers",
         "//absl/profiling:sample_recorder",
         "//absl/synchronization",
@@ -570,6 +572,14 @@ cc_library(
 )
 
 cc_library(
+    name = "have_neon",
+    hdrs = ["internal/have_neon.h"],
+    copts = ABSL_DEFAULT_COPTS,
+    linkopts = ABSL_DEFAULT_LINKOPTS,
+    visibility = ["//visibility:private"],
+)
+
+cc_library(
     name = "have_sse",
     hdrs = ["internal/have_sse.h"],
     copts = ABSL_DEFAULT_COPTS,
@@ -602,6 +612,7 @@ cc_library(
         ":hashtable_debug_hooks",
         ":hashtablez_sampler",
         ":have_sse",
+        ":have_neon",
         "//absl/base:config",
         "//absl/base:core_headers",
         "//absl/base:endian",

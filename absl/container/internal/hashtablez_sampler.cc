@@ -22,6 +22,7 @@
 
 #include "absl/base/attributes.h"
 #include "absl/container/internal/have_sse.h"
+#include "absl/container/internal/have_neon.h"
 #include "absl/debugging/stacktrace.h"
 #include "absl/memory/memory.h"
 #include "absl/profiling/internal/exponential_biased.h"
@@ -160,7 +161,7 @@ void RecordInsertSlow(HashtablezInfo* info, size_t hash,
   // SwissTables probe in groups of 16, so scale this to count items probes and
   // not offset from desired.
   size_t probe_length = distance_from_desired;
-#if ABSL_INTERNAL_RAW_HASH_SET_HAVE_SSE2
+#if ABSL_INTERNAL_RAW_HASH_SET_HAVE_SSE2 || ABSL_INTERNAL_RAW_HASH_SET_HAVE_NEON
   probe_length /= 16;
 #else
   probe_length /= 8;

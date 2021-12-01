@@ -551,6 +551,7 @@ absl_cc_library(
     absl::base
     absl::exponential_biased
     absl::have_sse
+    absl::have_neon
     absl::sample_recorder
     absl::synchronization
 )
@@ -565,6 +566,7 @@ absl_cc_test(
   DEPS
     absl::hashtablez_sampler
     absl::have_sse
+    absl::have_neon
     GTest::gmock_main
 )
 
@@ -589,6 +591,15 @@ absl_cc_library(
   DEPS
     absl::config
   PUBLIC
+)
+
+absl_cc_library(
+  NAME
+    have_neon
+  HDRS
+    "internal/have_neon.h"
+  COPTS
+    ${ABSL_DEFAULT_COPTS}
 )
 
 absl_cc_library(
@@ -670,6 +681,7 @@ absl_cc_library(
     absl::hash_policy_traits
     absl::hashtable_debug_hooks
     absl::have_sse
+    absl::have_neon
     absl::memory
     absl::meta
     absl::optional

@@ -123,10 +123,17 @@
 #include "absl/container/internal/hashtable_debug_hooks.h"
 #include "absl/container/internal/hashtablez_sampler.h"
 #include "absl/container/internal/have_sse.h"
+#include "absl/container/internal/have_neon.h"
 #include "absl/memory/memory.h"
 #include "absl/meta/type_traits.h"
 #include "absl/numeric/bits.h"
 #include "absl/utility/utility.h"
+
+#if 1
+#define FORCE_NEON_INLINE __attribute__((always_inline))
+#else
+#define FORCE_NEON_INLINE
+#endif
 
 namespace absl {
 ABSL_NAMESPACE_BEGIN
@@ -216,7 +223,7 @@ uint32_t TrailingZeros(T x) {
 template <class T, int SignificantBits, int Shift = 0>
 class BitMask {
   static_assert(std::is_unsigned<T>::value, "");
-  static_assert(Shift == 0 || Shift == 3, "");
+  static_assert(Shift == 0 || Shift == 2 || Shift == 3, "");
 
  public:
   // These are useful for unit tests (gunit).
@@ -429,7 +436,8 @@ struct GroupPortableImpl {
     constexpr uint64_t msbs = 0x8080808080808080ULL;
     constexpr uint64_t lsbs = 0x0101010101010101ULL;
     auto x = ctrl ^ (lsbs * hash);
-    return BitMask<uint64_t, kWidth, 3>((x - lsbs) & ~x & msbs);
+    auto mask = (x - lsbs) & ~x & msbs;
+    return BitMask<uint64_t, kWidth, 3>(mask);
   }
 
   BitMask<uint64_t, kWidth, 3> MatchEmpty() const {
@@ -458,8 +466,72 @@ struct GroupPortableImpl {
   uint64_t ctrl;
 };
 
+#if ABSL_INTERNAL_RAW_HASH_SET_HAVE_NEON
+
+struct GroupNEONImpl {
+  static constexpr size_t kWidth = 16;
+  static constexpr size_t kFastWidth = 8;
+
+  explicit GroupNEONImpl(const ctrl_t* pos)
+      : ctrl(vld1q_u8 (reinterpret_cast<const uint8_t*> (pos))) {}
+
+  BitMask<uint64_t, kWidth, 2> Match(h2_t hash) const {
+    uint8x16_t v = vdupq_n_u8(hash);
+    uint8x16_t vidx = {0x8, 0x80, 0x8, 0x80, 0x8, 0x80, 0x8, 0x80,
+		       0x8, 0x80, 0x8, 0x80, 0x8, 0x80, 0x8, 0x80};
+    uint8x16_t bytemask = vceqq_u8(v, ctrl);
+    uint8x16_t mask = vandq_u8(bytemask, vidx);
+    mask = vpaddq_u8(mask, mask);
+
+    return BitMask<uint64_t, kWidth, 2>(vgetq_lane_u64 ((uint64x2_t) mask, 0));
+  }
+
+  BitMask<uint64_t, kWidth, 2> MatchEmpty() const {
+    return Match(static_cast<h2_t>(ctrl_t::kEmpty));
+  }
+
+  BitMask<uint64_t, kWidth, 2> MatchEmptyOrDeleted() const {
+    int8x16_t vSentinel = vdupq_n_s8 (-1);
+    uint8x16_t vidx = {0x8, 0x80, 0x8, 0x80, 0x8, 0x80, 0x8, 0x80,
+		       0x8, 0x80, 0x8, 0x80, 0x8, 0x80, 0x8, 0x80};
+    uint8x16_t bytemask = vcltq_s8((int8x16_t) ctrl, vSentinel);
+    uint8x16_t mask = vandq_u8(bytemask, vidx);
+    mask = vpaddq_u8(mask, mask);
+
+    return BitMask<uint64_t, kWidth, 2>(vgetq_lane_u64((uint64x2_t) mask, 0));
+  }
+
+  uint32_t CountLeadingEmptyOrDeleted() const {
+      int8x16_t vSentinel = vdupq_n_s8 (-1);
+      uint8x16_t bytemask = vcltq_s8((int8x16_t)ctrl, vSentinel);
+      uint64_t mask0 = vgetq_lane_u64((uint64x2_t)bytemask, 0) + 1;
+      uint64_t mask1 = vgetq_lane_u64((uint64x2_t)bytemask, 1) + 1;
+      if (mask0 == 0) {
+	  if (mask1 == 0)
+	    return 16;
+	return 8 + (TrailingZeros(mask1) >> 3);
+      }
+      else
+	return TrailingZeros(mask0) >> 3;
+  }
+
+  void ConvertSpecialToEmptyAndFullToDeleted(ctrl_t* dst) const {
+      uint8x16_t msbs = vdupq_n_u8(0x80);
+      uint8x16_t x126 = vdupq_n_u8(126);
+      uint8x16_t mask = vcgezq_s8((int8x16_t) ctrl);
+      uint8x16_t res = vorrq_u8(msbs, vandq_u8(mask, x126));
+      vst1q_u8(reinterpret_cast<uint8_t *>(dst), res);
+
+  }
+
+  uint8x16_t ctrl;
+};
+#endif
+
 #if ABSL_INTERNAL_RAW_HASH_SET_HAVE_SSE2
 using Group = GroupSse2Impl;
+#elif ABSL_INTERNAL_RAW_HASH_SET_HAVE_NEON
+using Group = GroupNEONImpl;
 #else
 using Group = GroupPortableImpl;
 #endif
@@ -501,7 +573,7 @@ inline size_t NormalizeCapacity(size_t n) {
 inline size_t CapacityToGrowth(size_t capacity) {
   assert(IsValidCapacity(capacity));
   // `capacity*7/8`
-  if (Group::kWidth == 8 && capacity == 7) {
+  if (Group::kFastWidth == 8 && capacity == 7) {
     // x-x/8 does not work when x==7.
     return 6;
   }
@@ -511,7 +583,7 @@ inline size_t CapacityToGrowth(size_t capacity) {
 // Might not be a valid one and requires NormalizeCapacity().
 inline size_t GrowthToLowerboundCapacity(size_t growth) {
   // `growth*8/7`
-  if (Group::kWidth == 8 && growth == 7) {
+  if (Group::kFastWidth == 8 && growth == 7) {
     // x+(x-1)/7 does not work when x==7.
     return 8;
   }
@@ -576,6 +648,11 @@ inline probe_seq<Group::kWidth> probe(const ctrl_t* ctrl, size_t hash,
   return probe_seq<Group::kWidth>(H1(hash, ctrl), capacity);
 }
 
+inline probe_seq<Group::kFastWidth> fast_probe(const ctrl_t* ctrl, size_t hash,
+                                      size_t capacity) {
+  return probe_seq<Group::kFastWidth>(H1(hash, ctrl), capacity);
+}
+
 // Probes the raw_hash_set with the probe sequence for hash and returns the
 // pointer to the first empty or deleted slot.
 // NOTE: this function must work with tables having both ctrl_t::kEmpty and
@@ -587,9 +664,41 @@ inline probe_seq<Group::kWidth> probe(const ctrl_t* ctrl, size_t hash,
 // - there are enough slots
 // - the element with the hash is not in the table
 template <typename = void>
-inline FindInfo find_first_non_full(const ctrl_t* ctrl, size_t hash,
-                                    size_t capacity) {
+inline FindInfo FORCE_NEON_INLINE
+find_first_non_full(const ctrl_t* ctrl, size_t hash, size_t capacity) {
   auto seq = probe(ctrl, hash, capacity);
+#if ABSL_INTERNAL_RAW_HASH_SET_HAVE_NEON
+  GroupPortableImpl g{ctrl + seq.offset()};
+  auto mask = g.MatchEmptyOrDeleted();
+  if (mask) {
+#if !defined(NDEBUG)
+    // We want to add entropy even when ASLR is not enabled.
+    // In debug build we will randomly insert in either the front or back of
+    // the group.
+    // TODO(kfm,sbenza): revisit after we do unconditional mixing
+    if (!is_small(capacity) && ShouldInsertBackwards(hash, ctrl)) {
+      return {seq.offset(mask.HighestBitSet()), seq.index()};
+    }
+#endif
+    return {seq.offset(mask.LowestBitSet()), seq.index()};
+  }
+  g = GroupPortableImpl{ctrl + seq.offset(8)};
+  mask = g.MatchEmptyOrDeleted();
+  if (mask) {
+#if !defined(NDEBUG)
+    // We want to add entropy even when ASLR is not enabled.
+    // In debug build we will randomly insert in either the front or back of
+    // the group.
+    // TODO(kfm,sbenza): revisit after we do unconditional mixing
+    if (!is_small(capacity) && ShouldInsertBackwards(hash, ctrl)) {
+      return {seq.offset(mask.HighestBitSet() + 8), seq.index() + 8};
+    }
+#endif
+    return {seq.offset(mask.LowestBitSet() + 8), seq.index() + 8};
+  }
+  seq.next();
+  assert(seq.index() <= capacity && "full table!");
+#endif
   while (true) {
     Group g{ctrl + seq.offset()};
     auto mask = g.MatchEmptyOrDeleted();
@@ -1466,8 +1575,30 @@ class raw_hash_set {
   // 2. The type of the key argument doesn't have to be key_type. This is so
   // called heterogeneous key support.
   template <class K = key_type>
-  iterator find(const key_arg<K>& key, size_t hash) {
+  inline FORCE_NEON_INLINE iterator find(const key_arg<K>& key, size_t hash) {
     auto seq = probe(ctrl_, hash, capacity_);
+#if ABSL_INTERNAL_RAW_HASH_SET_HAVE_NEON
+    GroupPortableImpl g{ctrl_ + seq.offset()};
+    for (int i : g.Match(H2(hash)))
+      {
+	if (ABSL_PREDICT_TRUE(PolicyTraits::apply(
+		EqualElement<K>{key, eq_ref()},
+		PolicyTraits::element(slots_ + seq.offset(i)))))
+	  return iterator_at(seq.offset(i));
+      }
+    if (ABSL_PREDICT_TRUE(g.MatchEmpty())) return end();
+    g = GroupPortableImpl{ctrl_ + seq.offset(8)};
+    for (int i : g.Match(H2(hash)))
+      {
+	if (ABSL_PREDICT_TRUE(PolicyTraits::apply(
+		EqualElement<K>{key, eq_ref()},
+		PolicyTraits::element(slots_ + seq.offset(8 + i)))))
+	  return iterator_at(seq.offset(8 + i));
+      }
+    if (ABSL_PREDICT_TRUE(g.MatchEmpty())) return end();
+    seq.next();
+    assert(seq.index() <= capacity_ && "full table!");
+#endif
     while (true) {
       Group g{ctrl_ + seq.offset()};
       for (uint32_t i : g.Match(H2(hash))) {
@@ -1482,17 +1613,17 @@ class raw_hash_set {
     }
   }
   template <class K = key_type>
-  iterator find(const key_arg<K>& key) {
+  iterator FORCE_NEON_INLINE find(const key_arg<K>& key) {
     prefetch_heap_block();
     return find(key, hash_ref()(key));
   }
 
   template <class K = key_type>
-  const_iterator find(const key_arg<K>& key, size_t hash) const {
+  const_iterator FORCE_NEON_INLINE find(const key_arg<K>& key, size_t hash) const {
     return const_cast<raw_hash_set*>(this)->find(key, hash);
   }
   template <class K = key_type>
-  const_iterator find(const key_arg<K>& key) const {
+  const_iterator FORCE_NEON_INLINE find(const key_arg<K>& key) const {
     prefetch_heap_block();
     return find(key, hash_ref()(key));
   }
@@ -1624,9 +1755,9 @@ class raw_hash_set {
     assert(IsFull(*it.inner_.ctrl_) && "erasing a dangling iterator");
     --size_;
     const size_t index = static_cast<size_t>(it.inner_.ctrl_ - ctrl_);
-    const size_t index_before = (index - Group::kWidth) & capacity_;
-    const auto empty_after = Group(it.inner_.ctrl_).MatchEmpty();
-    const auto empty_before = Group(ctrl_ + index_before).MatchEmpty();
+    const size_t index_before = (index - Group::kFastWidth) & capacity_;
+    const auto empty_after = GroupPortableImpl(it.inner_.ctrl_).MatchEmpty();
+    const auto empty_before = GroupPortableImpl(ctrl_ + index_before).MatchEmpty();
 
     // We count how many consecutive non empties we have to the right and to the
     // left of `it`. If the sum is >= kWidth then there is at least one probe
@@ -1634,7 +1765,7 @@ class raw_hash_set {
     bool was_never_full =
         empty_before && empty_after &&
         static_cast<size_t>(empty_after.TrailingZeros() +
-                            empty_before.LeadingZeros()) < Group::kWidth;
+                            empty_before.LeadingZeros()) < Group::kFastWidth;
 
     SetCtrl(index, was_never_full ? ctrl_t::kEmpty : ctrl_t::kDeleted,
             capacity_, ctrl_, slots_, sizeof(slot_type));
@@ -1754,9 +1885,9 @@ class raw_hash_set {
       // Verify if the old and new i fall within the same group wrt the hash.
       // If they do, we don't need to move the object as it falls already in the
       // best probe we can.
-      const size_t probe_offset = probe(ctrl_, hash, capacity_).offset();
+      const size_t probe_offset = fast_probe(ctrl_, hash, capacity_).offset();
       const auto probe_index = [probe_offset, this](size_t pos) {
-        return ((pos - probe_offset) & capacity_) / Group::kWidth;
+        return ((pos - probe_offset) & capacity_) / Group::kFastWidth;
       };
 
       // Element doesn't move.
@@ -1840,9 +1971,27 @@ class raw_hash_set {
     }
   }
 
-  bool has_element(const value_type& elem) const {
+  bool FORCE_NEON_INLINE has_element(const value_type& elem) const {
     size_t hash = PolicyTraits::apply(HashElement{hash_ref()}, elem);
     auto seq = probe(ctrl_, hash, capacity_);
+#if ABSL_INTERNAL_RAW_HASH_SET_HAVE_NEON
+    GroupPortableImpl g{ctrl_ + seq.offset()};
+    for (int i : g.Match(H2(hash))) {
+      if (ABSL_PREDICT_TRUE(PolicyTraits::element(slots_ + seq.offset(i)) ==
+			    elem))
+	return true;
+    }
+    if (ABSL_PREDICT_TRUE(g.MatchEmpty())) return false;
+    g = GroupPortableImpl{ctrl_ + seq.offset(8)};
+    for (int i : g.Match(H2(hash))) {
+      if (ABSL_PREDICT_TRUE(PolicyTraits::element(slots_ + seq.offset(i + 8)) ==
+			    elem))
+	return true;
+    }
+    if (ABSL_PREDICT_TRUE(g.MatchEmpty())) return false;
+    seq.next();
+    assert(seq.index() <= capacity_ && "full table!");
+#endif
     while (true) {
       Group g{ctrl_ + seq.offset()};
       for (uint32_t i : g.Match(H2(hash))) {
@@ -1871,10 +2020,35 @@ class raw_hash_set {
 
  protected:
   template <class K>
-  std::pair<size_t, bool> find_or_prepare_insert(const K& key) {
+  std::pair<size_t, bool>
+find_or_prepare_insert(const K& key) {
     prefetch_heap_block();
     auto hash = hash_ref()(key);
     auto seq = probe(ctrl_, hash, capacity_);
+#if ABSL_INTERNAL_RAW_HASH_SET_HAVE_NEON
+    GroupPortableImpl g{ctrl_ + seq.offset()};
+    for (int i : g.Match(H2(hash)))
+      {
+	if (ABSL_PREDICT_TRUE(PolicyTraits::apply(
+		EqualElement<K>{key, eq_ref()},
+		PolicyTraits::element(slots_ + seq.offset(i)))))
+	  return {seq.offset(i), false};
+      }
+    if (ABSL_PREDICT_TRUE(g.MatchEmpty()))
+      return {prepare_insert(hash), true};
+    g = GroupPortableImpl{ctrl_ + seq.offset (8)};
+    for (int i : g.Match(H2(hash)))
+      {
+	if (ABSL_PREDICT_TRUE(PolicyTraits::apply(
+		EqualElement<K>{key, eq_ref()},
+		PolicyTraits::element(slots_ + seq.offset(i + 8)))))
+	  return {seq.offset(i + 8), false};
+      }
+    if (ABSL_PREDICT_TRUE(g.MatchEmpty()))
+      return {prepare_insert(hash), true};
+    seq.next();
+    assert(seq.index() <= capacity_ && "full table!");
+#endif
     while (true) {
       Group g{ctrl_ + seq.offset()};
       for (uint32_t i : g.Match(H2(hash))) {
@@ -1990,11 +2164,35 @@ struct HashtableDebugAccess<Set, absl::void_t<typename Set::raw_hash_set>> {
   using Traits = typename Set::PolicyTraits;
   using Slot = typename Traits::slot_type;
 
-  static size_t GetNumProbes(const Set& set,
-                             const typename Set::key_type& key) {
+  static size_t FORCE_NEON_INLINE
+    GetNumProbes(const Set& set, const typename Set::key_type& key) {
     size_t num_probes = 0;
     size_t hash = set.hash_ref()(key);
     auto seq = probe(set.ctrl_, hash, set.capacity_);
+#if ABSL_INTERNAL_RAW_HASH_SET_HAVE_NEON
+    GroupPortableImpl scalar_g{set.ctrl_ + seq.offset()};
+    for (int i : scalar_g.Match(container_internal::H2(hash))) {
+      if (Traits::apply(
+	      typename Set::template EqualElement<typename Set::key_type>{
+		  key, set.eq_ref()},
+	      Traits::element(set.slots_ + seq.offset(i))))
+	return num_probes;
+      ++num_probes;
+    }
+    if (scalar_g.MatchEmpty()) return num_probes;
+    scalar_g = GroupPortableImpl{set.ctrl_ + seq.offset(8)};
+    for (int i : scalar_g.Match(container_internal::H2(hash))) {
+      if (Traits::apply(
+	      typename Set::template EqualElement<typename Set::key_type>{
+		  key, set.eq_ref()},
+	      Traits::element(set.slots_ + seq.offset(i + 8))))
+	return num_probes;
+      ++num_probes;
+    }
+    if (scalar_g.MatchEmpty()) return num_probes;
+    ++num_probes;
+    seq.next();
+#endif
     while (true) {
       container_internal::Group g{set.ctrl_ + seq.offset()};
       for (uint32_t i : g.Match(container_internal::H2(hash))) {

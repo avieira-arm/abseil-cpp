@@ -83,7 +83,7 @@ TEST(Util, GrowthAndCapacity) {
     // The capacity is large enough for `growth`.
     EXPECT_THAT(CapacityToGrowth(capacity), Ge(growth));
     // For (capacity+1) < kWidth, growth should equal capacity.
-    if (capacity + 1 < Group::kWidth) {
+    if (capacity + 1 < Group::kFastWidth) {
       EXPECT_THAT(CapacityToGrowth(capacity), Eq(capacity));
     } else {
       EXPECT_THAT(CapacityToGrowth(capacity), Lt(capacity));
@@ -165,6 +165,15 @@ TEST(BitMask, LeadingTrailing) {
 
   EXPECT_EQ((BitMask<uint64_t, 8, 3>(0x8000000000000000).LeadingZeros()), 0);
   EXPECT_EQ((BitMask<uint64_t, 8, 3>(0x8000000000000000).TrailingZeros()), 7);
+
+  EXPECT_EQ((BitMask<uint64_t, 16, 2>(0x0008008080808000).LeadingZeros()), 3);
+  EXPECT_EQ((BitMask<uint64_t, 16, 2>(0x0000008080808080).TrailingZeros()), 1);
+
+  EXPECT_EQ((BitMask<uint64_t, 16, 2>(0x0000000000000008).LeadingZeros()), 15);
+  EXPECT_EQ((BitMask<uint64_t, 16, 2>(0x0000000000008008).TrailingZeros()), 0);
+
+  EXPECT_EQ((BitMask<uint64_t, 16, 2>(0x8000000000000000).LeadingZeros()), 0);
+  EXPECT_EQ((BitMask<uint64_t, 16, 2>(0x8000000000000000).TrailingZeros()), 15);
 }
 
 TEST(Group, EmptyGroup) {
@@ -545,7 +554,7 @@ TEST(Table, InsertCollisionAndFindAfterDelete) {
   BadTable t;  // all elements go to the same group.
   // Have at least 2 groups with Group::kWidth collisions
   // plus some extra collisions in the last group.
-  constexpr size_t kNumInserts = Group::kWidth * 2 + 5;
+  constexpr size_t kNumInserts = 8 * 2 + 5;
   for (size_t i = 0; i < kNumInserts; ++i) {
     auto res = t.emplace(i);
     EXPECT_TRUE(res.second);
